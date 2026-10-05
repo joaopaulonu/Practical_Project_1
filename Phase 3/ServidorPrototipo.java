@@ -6,6 +6,13 @@ import java.time.format.DateTimeFormatter;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.lang.management.ManagementFactory;
 import com.sun.management.OperatingSystemMXBean;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Locale;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Collections;
 
 public class ServidorPrototipo {
     // Porta onde o servidor escuta
@@ -14,6 +21,8 @@ public class ServidorPrototipo {
     static final DateTimeFormatter HORA = DateTimeFormatter.ofPattern("HH:mm");
     // Contador de clientes ativos
     static final AtomicInteger clientesAtivos = new AtomicInteger(0);
+    // Registro compartilhado: main adiciona handlers e workers removem ao terminar.
+    static final List<ClienteHandler> handlers = Collections.synchronizedList(new ArrayList<>());
     // Bean para obter informações do sistema operacional
     static final OperatingSystemMXBean osBean =
             (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
@@ -21,7 +30,7 @@ public class ServidorPrototipo {
     // O método main do servidor recebe como argumento o número máximo de clientes simultâneos.
     public static void main(String[] args) {
         // Verifica se o argumento(<max_clientes>) foi fornecido corretamente
-        if (args.length < 1) {
+        if (args.length != 1) {
             System.err.println("Uso: java ServidorPrototipo <max_clientes>");
             return;
         }
@@ -58,17 +67,18 @@ public class ServidorPrototipo {
     }
 
     private static void atenderConexao(Socket socket, int limite) {
-        // Só a thread principal incrementa, então nunca passa do limite
-        if (clientesAtivos.incrementAndGet() > limite) {
-            clientesAtivos.decrementAndGet();
-            rejeitarCliente(socket, limite);
-            return;
-        }
+        // Reserva na main para que workers concorrentes nunca ultrapassem o limite.
+        boolean vagaReservada = clientesAtivos.incrementAndGet() <= limite;
+        if (!vagaReservada) clientesAtivos.decrementAndGet();
+        ClienteHandler handler = null;
         try {
-            new Thread(new ClienteHandler(socket)).start();
+            handler = new ClienteHandler(socket, limite, vagaReservada);
+            handlers.add(handler);
+            new Thread(handler, "cliente-" + socket.getPort()).start();
         } catch (RuntimeException | OutOfMemoryError e) {
-            // Thread não arrancou, logo o finally do worker nunca vai correr
-            clientesAtivos.decrementAndGet();
+            // Worker não arrancou: a main desfaz o registro e a reserva.
+            if (handler != null) handlers.remove(handler);
+            if (vagaReservada) clientesAtivos.decrementAndGet();
             fechar(socket);
             System.out.println("Nao foi possivel atender " + socket.getRemoteSocketAddress());
         }
@@ -77,7 +87,7 @@ public class ServidorPrototipo {
     private static void rejeitarCliente(Socket socket, int limite) {
         System.out.println("Ligacao recusada (limite atingido): " + socket.getRemoteSocketAddress());
         try (Socket s = socket;
-             PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+             PrintWriter out = new PrintWriter(s.getOutputStream(), true, StandardCharsets.UTF_8)) {
             out.println("<" + LocalTime.now().format(HORA) + ">: RECUSADO! Limite de "
                     + limite + " clientes excedido. Tente mais tarde.");
         } catch (IOException e) {
@@ -92,45 +102,57 @@ public class ServidorPrototipo {
     static class ClienteHandler implements Runnable {
         private final Socket socket;
         private final String id;
+        private final int limite;
+        private final boolean vagaReservada;
         private PrintWriter out;
 
-        private volatile boolean monitorRodando = false;
-        private Thread monitorThread;   // só mexido pela worker thread
+        // Apenas a worker altera o mapa. Cada tarefa possui sua própria flag.
+        private final Map<String, MonitorTask> monitores = new HashMap<>();
+        private static final String MENU = "Menu: CPU-<segundos>, memoria-<segundos>, memoria, Quit, Exit";
 
-        ClienteHandler(Socket socket) {
+        ClienteHandler(Socket socket, int limite, boolean vagaReservada) {
             this.socket = socket;
             this.id = String.valueOf(socket.getRemoteSocketAddress());
+            this.limite = limite;
+            this.vagaReservada = vagaReservada;
         }
 
         @Override
         public void run() {
-            System.out.println("Cliente ligado: " + id + " | ativos: " + clientesAtivos.get());
             try {
-                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                out = new PrintWriter(socket.getOutputStream(), true);
+                // A recusa também ocorre na worker, mantendo accept livre de envios.
+                if (!vagaReservada) {
+                    rejeitarCliente(socket, limite);
+                    return;
+                }
+                System.out.println("Cliente ligado: " + id + " | ativos: " + clientesAtivos.get());
+                BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                out = new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8);
 
                 out.println("<" + LocalTime.now().format(HORA)
-                        + ">: CONECTADO!! Menu: CPU-<segundos>, memoria, Quit, Exit");
+                        + ">: CONECTADO!! " + MENU);
+                if (out.checkError()) return;
 
                 String comando;
                 // Loop de leitura de comandos do cliente
                 while ((comando = in.readLine()) != null) {
                     comando = comando.trim();
 
-                    if (comando.startsWith("CPU-")) {
-                        iniciarMonitorCpu(comando);
+                    if (comando.regionMatches(true, 0, "CPU-", 0, 4)
+                            || comando.regionMatches(true, 0, "memoria-", 0, 8)) {
+                        iniciarMonitor(comando);
                     } else if (comando.equalsIgnoreCase("memoria")) {
                         enviarMemoria();
-                    } else if (comando.equals("Quit")) {
-                        if (monitorRodando) {
-                            pararMonitor();
-                        } else {
-                            out.println("Nenhum monitor em execucao.");
-                        }
-                    } else if (comando.equals("Exit")) {
+                    } else if (comando.equalsIgnoreCase("Quit")) {
+                        boolean haviaMonitores = !monitores.isEmpty();
+                        pararMonitores();
+                        enviar(haviaMonitores ? "Todos os monitores foram interrompidos." : "Nenhum monitor em execucao.");
+                    } else if (comando.equalsIgnoreCase("Exit")) {
+                        pararMonitores();
+                        enviar("Conexao encerrada por solicitacao do cliente.");
                         break;
                     } else {
-                        out.println("Comando desconhecido. Menu: CPU-<segundos>, memoria, Quit, Exit");
+                        enviar("Comando desconhecido. " + MENU);
                     }
                 }
             } catch (IOException e) {
@@ -140,63 +162,113 @@ public class ServidorPrototipo {
                 System.out.println("Erro inesperado com " + id + ": " + e.getMessage());
             } finally {
                 // Garante que a vaga é liberada, aconteça o que acontecer
-                pararMonitor();
                 fechar(socket);
-                int restantes = clientesAtivos.decrementAndGet();
-                System.out.println("Cliente desligado: " + id + " | ativos: " + restantes);
+                pararMonitores();
+                handlers.remove(this);
+                // Recusados não ocuparam vaga e não podem diminuir o contador.
+                if (vagaReservada) {
+                    int restantes = clientesAtivos.decrementAndGet();
+                    System.out.println("Cliente desligado: " + id + " | ativos: " + restantes);
+                }
             }
         }
 
-        private void iniciarMonitorCpu(String comando) {
-            if (monitorRodando) {
-                out.println("Ja existe um monitor CPU ativo. Use Quit para o parar.");
-                return;
-            }
+        private void iniciarMonitor(String comando) {
+            String[] partes = comando.split("-", 2);
+            String tipo = partes[0].toLowerCase(Locale.ROOT);
             final int tempoSegundos;
             try {
-                tempoSegundos = Integer.parseInt(comando.split("-", 2)[1].trim());
+                tempoSegundos = Integer.parseInt(partes[1].trim());
                 if (tempoSegundos < 1) throw new NumberFormatException();
             } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
-                out.println("Formato invalido. Use CPU-<segundos> com segundos >= 1 (ex.: CPU-5).");
+                enviar("Formato invalido. Use CPU-<segundos> ou memoria-<segundos> com segundos >= 1.");
                 return;
             }
 
-            monitorRodando = true;
-            monitorThread = new Thread(() -> {
-                try {
-                    while (monitorRodando) {
-                        double cpu = osBean.getCpuLoad() * 100;
-                        String valor = cpu < 0 || Double.isNaN(cpu) ? "N/D" : String.format("%.2f%%", cpu);
-                        out.println("MONITOR CPU: " + valor);
-                        // Cliente sumiu: não vale a pena continuar a enviar
-                        if (out.checkError()) break;
-                        Thread.sleep(tempoSegundos * 1000L);
-                    }
-                } catch (InterruptedException e) {
-                    // interrompida por pararMonitor()
-                }
-                monitorRodando = false;
-                out.println("Monitor CPU encerrado.");
-            });
-            monitorThread.setDaemon(true);
-            monitorThread.start();
+            MonitorTask anterior = monitores.remove(tipo);
+            if (anterior != null) anterior.parar();
+            MonitorTask tarefa = new MonitorTask(tipo, tempoSegundos);
+            monitores.put(tipo, tarefa);
+            try {
+                enviar("Monitor " + tipo + " iniciado a cada " + tempoSegundos + "s.");
+                tarefa.thread.start();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                monitores.remove(tipo);
+                tarefa.parar();
+                enviar("Nao foi possivel iniciar o monitor " + tipo + ".");
+            }
         }
 
-        private void pararMonitor() {
-            monitorRodando = false;
-            if (monitorThread != null) {
-                monitorThread.interrupt();
-                monitorThread = null;
+        private void pararMonitores() {
+            for (MonitorTask tarefa : monitores.values()) tarefa.parar();
+            monitores.clear();
+        }
+
+        // Serializa mensagens de CPU, memoria e comandos no mesmo socket.
+        private synchronized boolean enviar(String mensagem) {
+            out.println(mensagem);
+            if (out.checkError()) {
+                fechar(socket); // Desbloqueia readLine e libera a vaga no finally da worker.
+                return false;
+            }
+            return true;
+        }
+
+        private final class MonitorTask implements Runnable {
+            private final String tipo;
+            private final int intervalo;
+            private volatile boolean executando = true;
+            private final Thread thread;
+
+            MonitorTask(String tipo, int intervalo) {
+                this.tipo = tipo;
+                this.intervalo = intervalo;
+                thread = new Thread(this, "monitor-" + tipo + "-" + id);
+                thread.setDaemon(true);
+            }
+
+            void parar() {
+                executando = false;
+                thread.interrupt();
+                // Aguarda o termino antes de confirmar Quit ou substituir o monitor.
+                try {
+                    thread.join();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+
+            @Override
+            public void run() {
+                try {
+                    while (executando && !socket.isClosed()) {
+                        if (tipo.equals("cpu")) {
+                            double cpu = osBean.getCpuLoad() * 100;
+                            String valor = cpu < 0 || !Double.isFinite(cpu) ? "N/D" : String.format("%.2f%%", cpu);
+                            if (!enviar("MONITOR CPU: " + valor)) break;
+                        } else if (!enviarMemoria()) {
+                            break;
+                        }
+                        Thread.sleep(intervalo * 1000L);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (RuntimeException e) {
+                    enviar("Nao foi possivel coletar a metrica de " + tipo + ".");
+                } finally {
+                    executando = false;
+                }
             }
         }
 
         // Envia informações de memória para o cliente
-        private void enviarMemoria() {
-            long total = osBean.getTotalPhysicalMemorySize();
-            long livre = osBean.getFreePhysicalMemorySize();
+        private boolean enviarMemoria() {
+            long total = osBean.getTotalMemorySize();
+            long livre = osBean.getFreeMemorySize();
+            if (total <= 0 || livre < 0) return enviar("MEMORIA: N/D");
             long usada = total - livre;
             double pct = total > 0 ? (usada * 100.0) / total : 0;
-            out.println(String.format("MEMORIA: usada %d MB / total %d MB (livre %d MB) - %.2f%% em uso",
+            return enviar(String.format("MEMORIA: usada %d MB / total %d MB (livre %d MB) - %.2f%% em uso",
                     usada / (1024 * 1024), total / (1024 * 1024), livre / (1024 * 1024), pct));
         }
     }

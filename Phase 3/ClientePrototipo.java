@@ -2,6 +2,7 @@
 import java.io.*;
 import java.net.*;
 import java.util.Scanner;
+import java.nio.charset.StandardCharsets;
 
 public class ClientePrototipo {
 
@@ -17,7 +18,7 @@ public class ClientePrototipo {
         Socket socket = conectar(host);
         if (socket == null) return;
 
-        try (socket; Scanner teclado = new Scanner(System.in)) {
+        try (socket; Scanner teclado = new Scanner(System.in, StandardCharsets.UTF_8)) {
             executar(socket, teclado);
         } catch (IOException e) {
             if (!saidaVoluntaria) System.out.println("Erro de comunicacao com o servidor.");
@@ -45,8 +46,8 @@ public class ClientePrototipo {
     }
 
     private static void executar(Socket socket, Scanner teclado) throws IOException {
-        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-        PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+        PrintWriter out = new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8);
 
         Thread leitor = new Thread(() -> {
             try {
@@ -68,16 +69,23 @@ public class ClientePrototipo {
 
         while (teclado.hasNextLine()) {
             String comando = teclado.nextLine();
+            boolean sair = comando.trim().equalsIgnoreCase("Exit");
+            // A flag deve ser marcada antes do envio: o servidor pode responder imediatamente.
+            if (sair) saidaVoluntaria = true;
             out.println(comando);
 
-            if (comando.trim().equals("Exit")) {
+            if (out.checkError()) {
+                System.out.println("Conexao perdida com o servidor.");
                 saidaVoluntaria = true;
                 return;
             }
-            // PrintWriter engole IOException; checkError detecta a ligação caída
-            if (out.checkError()) {
-                if (!saidaVoluntaria) System.out.println("Conexao perdida com o servidor.");
-                saidaVoluntaria = true;
+            if (sair) {
+                // Aguarda a confirmacao e o fechamento pelo servidor, sem esperar indefinidamente.
+                try {
+                    leitor.join(TIMEOUT_CONEXAO_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
                 return;
             }
         }
